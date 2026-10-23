@@ -56,15 +56,17 @@ export default function Home() {
       <section>
         <h1>Who merged these nuclei?</h1>
         <p className="muted" style={{ maxWidth: 760 }}>
-          Upload a microscopy image and its segmentation. The agent flags suspicious regions, forms a hypothesis, runs
-          allowlisted repair tools, verifies every attempt independently against reference data, and hands you an
-          auditable result to approve or reject.
+          Upload a microscopy image and its segmentation. The agent flags suspicious regions, diagnoses why the
+          segmentation failed, runs a tournament of competing repairs, verifies every candidate independently against
+          reference data, and hands you an auditable result to approve or reject.
         </p>
         {health && (
           <div className="row small">
             <span className="tag">planner: {health.planner}{health.model ? ` · ${health.model}` : ""}</span>
             <span className="tag">storage: {health.storage}</span>
-            <span className="tag">attempt budget: {health.max_attempts}</span>
+            <span className="tag">
+              tournament: {health.max_rounds} rounds × {health.candidates_per_round} candidates
+            </span>
           </div>
         )}
       </section>

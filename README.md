@@ -11,11 +11,14 @@ This is a research image-analysis quality-control tool. It is not a diagnostic o
 ```
 upload image + baseline mask (+ optional reference mask)
   -> inspect      Python: counts, areas, solidity; flags oversized / concave objects
-  -> decide       Gemini (or offline heuristic): hypothesis + one allowlisted tool with parameters
-  -> repair       Python: watershed_split / erosion_split / remove_small_objects / resegment_threshold
-  -> verify       Python: instance F1, count error, foreground IoU, integrity checks vs acceptance policy
-  -> retry / accept / abstain   (bounded by MAX_ATTEMPTS)
-  -> report       before/after overlays, metrics, reasoning, uncertainties
+  -> recall       Atlas hybrid search: similar past cases and the tools that fixed them
+  -> diagnose     Gemini (or offline heuristic): evidence-linked root causes
+  -> tournament   each round, 2-3 competing hypotheses, each tested with an allowlisted tool
+  -> verify       Python: every candidate scored on instance F1, count error, foreground IoU and integrity
+                  checks; leaderboard per round; the winner can be refined in the next round
+  -> accept / abstain   (bounded by MAX_ROUNDS)
+  -> suspects     per-region verdict against the reference: solved / partly split / still merged / left whole
+  -> report       before/after slider, change map, metrics, reasoning, downloadable evidence report
   -> human review approve / reject
 ```
 
@@ -30,9 +33,9 @@ upload image + baseline mask (+ optional reference mask)
 
 | | Before | After |
 |---|---|---|
-| Verified repairs | – | 11 / 12 (1 abstained) |
-| Mean instance F1 | 0.785 | 0.882 |
-| Mean \|count error\| | 8.0 | 4.5 |
+| Verified repairs | – | 12 / 12 |
+| Mean instance F1 | 0.785 | 0.887 |
+| Mean \|count error\| | 8.0 | 4.1 |
 | Mean foreground IoU | 0.828 | 0.828 |
 
 Reproduce with `python backend/scripts/evaluate.py --dir datasets/heldout_dsb`.

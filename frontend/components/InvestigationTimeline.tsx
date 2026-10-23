@@ -32,6 +32,16 @@ function DecisionBody({ data }: { data: Record<string, any> }) {
           <code>{params.map(([k, v]) => `${k}=${v}`).join("  ")}</code>
         </div>
       )}
+      {data.candidates?.length > 0 && (
+        <ul style={{ margin: "0.25rem 0", paddingLeft: "1.1rem" }}>
+          {data.candidates.map((c: { name: string; tool: string; hypothesis: string }) => (
+            <li key={c.name} style={{ border: 0, padding: 0, margin: 0 }}>
+              <strong>{c.name}</strong> <code className="muted">{c.tool}</code>{" "}
+              <span className="muted">{c.hypothesis}</span>
+            </li>
+          ))}
+        </ul>
+      )}
       {typeof data.confidence === "number" && <div className="muted">confidence {data.confidence.toFixed(2)}</div>}
     </div>
   );

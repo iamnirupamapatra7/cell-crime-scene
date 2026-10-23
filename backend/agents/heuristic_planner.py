@@ -1,12 +1,53 @@
 """Deterministic offline planner. Used when no Gemini key is configured, or as a per-step fallback
-when a Gemini call fails. Every step it takes is labelled 'heuristic' in the audit trail."""
+when a Gemini call fails. Every step it takes is labelled 'heuristic' in the audit trail.
+
+It plays the same game as Gemini: diagnose root causes, then run tournament rounds of competing
+candidates, refine the winner, and accept or abstain.
+"""
 import math
 
-from agents.schemas import Decision, Report, ToolParams
+from agents.schemas import Candidate, Decision, Report, RootCause, ToolParams
 
 
-def _key(tool, params, base=None):
-    return tool, params.get("landscape"), params.get("target"), base or "baseline"
+def _key(tool, params):
+    return (tool, params.get("landscape"), params.get("target"), params.get("base") or "baseline",
+            params.get("min_distance"), params.get("radius"))
+
+
+def diagnose(state: dict) -> list[RootCause]:
+    """Evidence-linked root causes from the Python measurements."""
+    stats, mask = state["image_stats"], state["baseline"]["mask"]
+    regions = state["baseline"]["suspicious_regions"]
+    causes = []
+    if mask["suspicious_regions"]:
+        big = [r for r in regions if any("typical nucleus" in x for x in r["reasons"])]
+        concave = [r for r in regions if any("concave" in x for x in r["reasons"])]
+        biggest = max(regions, key=lambda r: r["area"])
+        causes.append(RootCause(
+            cause="Global threshold merges touching nuclei (under-segmentation)",
+            evidence=f"{mask['suspicious_regions']} of {mask['object_count']} objects flagged: {len(big)} oversized, "
+                     f"{len(concave)} with concave outlines; largest is region {biggest['label']} at "
+                     f"{biggest['area']} px (~{biggest['estimated_nuclei']} nuclei).",
+            likelihood="high"))
+    if stats["foreground_fraction"] > 0.25:
+        causes.append(RootCause(
+            cause="Crowded field: nuclei touch, so a single threshold cannot separate them",
+            evidence=f"{stats['foreground_fraction']:.0%} of the image is foreground.",
+            likelihood="medium"))
+    if stats["snr"] < 8:
+        causes.append(RootCause(
+            cause="Low contrast blurs the dim seam between adjacent nuclei",
+            evidence=f"Signal-to-noise ratio {stats['snr']:.1f} (below 8).",
+            likelihood="medium"))
+    if stats["noise_sigma"] > 0.04:
+        causes.append(RootCause(
+            cause="Camera noise roughens boundaries and can bridge neighbouring nuclei",
+            evidence=f"Estimated noise sigma {stats['noise_sigma']:.3f}.",
+            likelihood="low"))
+    if not causes:
+        causes.append(RootCause(cause="No segmentation failure evident",
+                                evidence="No oversized or concave objects in the baseline mask.", likelihood="medium"))
+    return causes
 
 
 class HeuristicPlanner:
@@ -15,89 +56,118 @@ class HeuristicPlanner:
     def decide(self, state: dict, images=None) -> Decision:
         mask = state["baseline"]["mask"]
         attempts = state["attempts"]
+        per_round = state.get("candidates_per_round", 3)
         radius = math.sqrt(max(mask["typical_area"], 1) / math.pi)
         md = max(3, round(0.7 * radius))
+        causes = diagnose(state)
         obs = [f"Baseline has {mask['object_count']} objects, {mask['suspicious_regions']} flagged as suspicious "
                f"(typical nucleus area {mask['typical_area']:.0f} px, radius ~{radius:.1f} px)."]
+        hypothesis = causes[0].cause
+        tried = {_key(a["tool"], a["params"] | {"base": a.get("base")}) for a in attempts}
+
+        def fresh(cands):
+            out = [c for c in cands if _key(c.tool, c.params.model_dump()) not in tried]
+            return out[:per_round]
+
+        def experiment(cands, rationale, extra_obs=()):
+            return Decision(observations=obs + list(extra_obs), root_causes=causes, hypothesis=hypothesis,
+                            action="experiment", candidates=cands, rationale=rationale, confidence=0.6)
 
         if not attempts and mask["suspicious_regions"] == 0:
-            return Decision(observations=obs, hypothesis="No evidence of merged nuclei in this mask.",
+            return Decision(observations=obs, root_causes=causes, hypothesis="No evidence of merged nuclei.",
                             action="abstain", rationale="Nothing is oversized or concave; repair would be guesswork.",
                             confidence=0.7)
 
-        if attempts:
-            last = attempts[-1]
-            v = last["verdict"]
-            m = last.get("metrics") or {}
+        if not attempts:
+            cands = fresh([
+                Candidate(name="Shape split", tool="watershed_split",
+                          hypothesis="Merged nuclei are round, so the distance transform has one peak per nucleus.",
+                          params=ToolParams(min_distance=md, sigma=1.0, landscape="distance", target="suspicious")),
+                Candidate(name="Seam split", tool="watershed_split",
+                          hypothesis="A dim intensity seam separates touching nuclei even when the outline is convex.",
+                          params=ToolParams(min_distance=md, sigma=1.5, landscape="intensity", target="suspicious")),
+                Candidate(name="Bridge cut", tool="erosion_split",
+                          hypothesis="Nuclei are joined by thin bridges that erosion can break.",
+                          params=ToolParams(radius=max(2, round(radius / 3)), target="suspicious")),
+            ])
+            return experiment(cands, "Three competing explanations for the merges; test all and keep what verifies.")
+
+        best = state.get("best_attempt")
+        best_run = next((a for a in attempts if a["attempt"] == best), None)
+        remaining = state.get("remaining_rounds", 0)
+        if best_run:
+            m = best_run.get("metrics") or {}
             refined = any(a.get("base") == "best" for a in attempts)
-            if v["passed"] and m.get("merged_objects", 0) > 0 and state["remaining_attempts"] > 1 and not refined:
-                return Decision(
-                    observations=obs + [f"Attempt {last['attempt']} passed but {m['merged_objects']} merged objects "
-                                        "remain."],
-                    hypothesis="Remaining merges have a weak shape cue; the intensity seam may separate them.",
-                    action="watershed_split",
-                    params=ToolParams(base="best", min_distance=md, sigma=1.5, landscape="intensity",
-                                      target="suspicious"),
-                    rationale="Refine the best attempt on its remaining suspicious regions only.", confidence=0.55)
-            if v["passed"] or v.get("unverified_improvement"):
-                return Decision(observations=obs + [f"Attempt {last['attempt']} passed verification."],
-                                hypothesis=state.get("hypothesis") or "Adjacent nuclei were merged.",
-                                action="accept", rationale="Independent verification passed; send for human review.",
-                                confidence=0.8)
-            if state.get("best_attempt"):
-                return Decision(observations=obs + [f"Attempt {last['attempt']} did not beat verified attempt "
-                                                    f"{state['best_attempt']}."],
-                                hypothesis=state.get("hypothesis") or "Adjacent nuclei were merged.",
-                                action="accept", rationale="Further retries are not improving on the verified "
-                                                           "attempt; send it for human review.", confidence=0.7)
-            base_m = state["baseline"].get("metrics") or {}
-            if last["tool"] == "watershed_split" and (
-                    m.get("split_objects", 0) > base_m.get("split_objects", 0) or m.get("count_error", 0) > 0):
-                p = dict(last["params"], min_distance=last["params"]["min_distance"] + 3)
-                return Decision(
-                    observations=obs + [f"Attempt {last['attempt']} over-split: count error {m.get('count_error'):+d},"
-                                        f" split objects {m.get('split_objects')}."],
-                    hypothesis="Merges are real but the watershed seeds are too dense.",
-                    action="watershed_split", params=ToolParams(**p),
-                    rationale="Raise min_distance to suppress spurious seeds.", confidence=0.6)
+            if m.get("merged_objects", 0) > 0 and remaining > 0 and not refined:
+                p = best_run["params"]
+                cands = fresh([
+                    Candidate(name="Refine: seam", tool="watershed_split",
+                              hypothesis="The remaining merges have a weak shape cue; the intensity seam may split them.",
+                              params=ToolParams(base="best", min_distance=md, sigma=1.5, landscape="intensity",
+                                                target="suspicious")),
+                    Candidate(name="Refine: finer seeds", tool="watershed_split",
+                              hypothesis="The winning split used seeds that were too sparse for the smallest nuclei.",
+                              params=ToolParams(base="best", min_distance=max(3, (p.get("min_distance") or md) - 2),
+                                                sigma=1.0, landscape="distance", target="suspicious")),
+                ])
+                if cands:
+                    return experiment(cands, f"Attempt {best} won but {m['merged_objects']} merged objects remain; "
+                                             "refine the winner on what is still flagged.",
+                                      [f"Attempt {best} is the current best."])
+            return Decision(observations=obs + [f"Attempt {best} is the best verified result."], root_causes=causes,
+                            hypothesis=hypothesis, action="accept",
+                            rationale="Independent verification passed and further rounds are not improving on it.",
+                            confidence=0.8)
 
-        plan = [
-            ("watershed_split", {"min_distance": md, "sigma": 1.0, "landscape": "distance", "target": "suspicious"},
-             "Merged nuclei are round; the distance transform should have one peak per nucleus."),
-            ("watershed_split", {"min_distance": md, "sigma": 1.5, "landscape": "intensity", "target": "suspicious"},
-             "Shape alone is ambiguous; use the dim seam in intensity between nuclei."),
-            ("erosion_split", {"radius": max(2, round(radius / 3)), "target": "suspicious"},
-             "Nuclei may be joined by thin bridges that erosion can break."),
-            ("watershed_split", {"min_distance": max(3, round(0.6 * radius)), "sigma": 1.0,
-                                 "landscape": "distance", "target": "all"},
-             "Suspicious-region detection may have missed merges; apply to every object."),
-        ]
-        tried = {_key(a["tool"], a["params"], a.get("base")) for a in attempts}
-        for tool, params, why in plan:
-            if _key(tool, params) not in tried:
-                return Decision(observations=obs, hypothesis="Adjacent nuclei were merged by global thresholding "
-                                                             "(under-segmentation).",
-                                action=tool, params=ToolParams(**params), rationale=why, confidence=0.6)
-
-        if state.get("best_attempt"):
-            return Decision(observations=obs, hypothesis="Adjacent nuclei were merged.", action="accept",
-                            rationale="Strategies exhausted; best verified attempt goes to review.", confidence=0.5)
-        return Decision(observations=obs, hypothesis="Merges could not be repaired with the allowed tools.",
-                        action="abstain", rationale="No attempt passed verification.", confidence=0.6)
+        # Nothing has passed yet.
+        base_m = state["baseline"].get("metrics") or {}
+        oversplit = any((a.get("metrics") or {}).get("split_objects", 0) > base_m.get("split_objects", 0)
+                        or (a.get("metrics") or {}).get("count_error", 0) > 0 for a in attempts)
+        if remaining > 0:
+            cands = fresh([
+                Candidate(name="Sparser seeds", tool="watershed_split",
+                          hypothesis="Merges are real but the seeds were too dense and over-split nuclei.",
+                          params=ToolParams(min_distance=md + 3, sigma=1.5, landscape="distance", target="suspicious")),
+                Candidate(name="Sweep all objects", tool="watershed_split",
+                          hypothesis="Suspicious-region detection missed merges; apply the split to every object.",
+                          params=ToolParams(min_distance=max(3, round(0.6 * radius)), sigma=1.0, landscape="distance",
+                                            target="all")),
+                Candidate(name="Much sparser seeds", tool="watershed_split",
+                          hypothesis="Nuclei are large relative to the detected peaks.",
+                          params=ToolParams(min_distance=md + 6, sigma=2.0, landscape="distance", target="suspicious")),
+            ] if oversplit else [
+                Candidate(name="Sweep all objects", tool="watershed_split",
+                          hypothesis="Suspicious-region detection missed merges; apply the split to every object.",
+                          params=ToolParams(min_distance=max(3, round(0.6 * radius)), sigma=1.0, landscape="distance",
+                                            target="all")),
+                Candidate(name="Thicker bridges", tool="erosion_split",
+                          hypothesis="The bridges between nuclei are thicker than the first erosion radius.",
+                          params=ToolParams(radius=max(3, round(radius / 2)), target="suspicious")),
+            ])
+            if cands:
+                return experiment(cands, "No candidate passed; test the next most likely explanations.",
+                                  ["Previous round over-split nuclei." if oversplit else "Previous round under-split."])
+        return Decision(observations=obs, root_causes=causes, hypothesis="Merges could not be repaired with the "
+                                                                         "allowed tools.",
+                        action="abstain", rationale="No candidate passed independent verification.", confidence=0.6)
 
     def write_report(self, final_state: dict) -> Report:
         best = final_state.get("best_attempt")
         base = final_state["baseline"]
+        n_tried = len(final_state.get("attempts", []))
+        n_rounds = len(final_state.get("rounds", []))
         if not best and final_state["status"] == "no_issue_found":
             return Report(summary="No oversized or concave objects were found; the baseline mask was left unchanged.",
                           uncertainties=["Merges between very small nuclei may fall below the detection thresholds."],
                           recommendation="Confirm by spot-checking the overlay.")
         if not best:
-            return Report(summary="No repair passed independent verification; the case is flagged for manual review.",
+            return Report(summary=f"{n_tried} candidate repairs over {n_rounds} rounds; none passed independent "
+                                  "verification, so the case is flagged for manual review.",
                           uncertainties=["The failure may need a tool outside the current allowlist."],
                           recommendation="Inspect the flagged regions manually.")
         bm, am = base.get("metrics"), best.get("metrics")
-        improvements, changed = [], [f"Applied {best['tool']} with {best['params']} (attempt {best['attempt']})."]
+        improvements, changed = [], [f"Tournament winner: {best['tool']} with {best['params']} "
+                                     f"(attempt {best['attempt']} of {n_tried}, {n_rounds} rounds)."]
         if bm and am:
             improvements = [
                 f"Instance F1 {bm['f1']:.3f} -> {am['f1']:.3f}",
@@ -115,4 +185,4 @@ class HeuristicPlanner:
                               ("passed independent verification." if best.get("verified") else
                                "reduced suspicious regions but is unverified."),
                       what_changed=changed, improvements=improvements, uncertainties=uncertainties,
-                      recommendation="Review the before/after overlay and approve or reject.")
+                      recommendation="Review the before/after overlay and the suspect lineup, then approve or reject.")

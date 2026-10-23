@@ -3,12 +3,15 @@
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
+import Diagnosis from "@/components/Diagnosis";
 import ImageViewer, { type Layer } from "@/components/ImageViewer";
+import Suspects from "@/components/Suspects";
+import Tournament from "@/components/Tournament";
 import InvestigationTimeline from "@/components/InvestigationTimeline";
 import { AttemptsTable, MetricsComparison, ProxyComparison } from "@/components/MetricsComparison";
 import ReviewPanel from "@/components/ReviewPanel";
 import { ActorChip, StatusBadge } from "@/components/StatusBadge";
-import { api, fileUrl, isRunning, type CaseDetail } from "@/lib/api";
+import { api, fileUrl, isRunning, reportUrl, type CaseDetail } from "@/lib/api";
 
 export default function CasePage() {
   const { id } = useParams<{ id: string }>();
@@ -51,9 +54,10 @@ export default function CasePage() {
     { key: "baseline", label: "Baseline segmentation (red = suspicious)", url: baselineRun?.overlay_url },
     ...attemptRuns.map((r) => ({
       key: `a${r.attempt}`,
-      label: `Attempt ${r.attempt}: ${r.tool}${r.attempt === best?.attempt ? " ★ best" : ""}`,
+      label: `Attempt ${r.attempt}: ${r.candidate ?? r.tool}${r.attempt === best?.attempt ? " ★ best" : ""}`,
       url: r.overlay_url,
     })),
+    { key: "diff", label: "What changed (red = merged, green = new cuts)", url: c.assets?.diff_overlay },
     { key: "reference", label: "Reference (ground truth)", url: c.assets?.reference_overlay },
   ];
   const latest = attemptRuns.at(-1);
@@ -117,6 +121,33 @@ export default function CasePage() {
             <ImageViewer layers={layers} left="baseline" right={rightDefault} />
           </section>
 
+          {c.root_causes && c.root_causes.length > 0 && (
+            <section className="panel">
+              <h2>Root-cause diagnosis</h2>
+              <Diagnosis causes={c.root_causes} />
+            </section>
+          )}
+
+          {c.suspects && c.suspects.length > 0 && c.image_stats && (
+            <section className="panel">
+              <h2>Suspect lineup</h2>
+              <Suspects
+                suspects={c.suspects}
+                shape={c.image_stats.shape}
+                baselineUrl={baselineRun?.overlay_url}
+                repairedUrl={best?.overlay_url}
+                referenceUrl={c.assets?.reference_overlay}
+              />
+            </section>
+          )}
+
+          {(c.rounds?.length ?? 0) > 0 && (
+            <section className="panel">
+              <h2>Hypothesis tournament</h2>
+              <Tournament rounds={c.rounds!} best={best?.attempt} baselineF1={c.baseline_metrics?.f1} />
+            </section>
+          )}
+
           <section className="panel">
             <h2>Verification</h2>
             {c.baseline_metrics ? (
@@ -150,13 +181,10 @@ export default function CasePage() {
             ) : (
               <p className="muted">Waiting for baseline measurements…</p>
             )}
-            <h3 style={{ marginTop: "1rem" }}>Attempts</h3>
-            <AttemptsTable runs={runs} best={best?.attempt} />
-            {best?.mask_url && (
-              <p className="small">
-                <a href={fileUrl(best.mask_url)}>Download repaired label mask (TIFF)</a>
-              </p>
-            )}
+            <details style={{ marginTop: "1rem" }}>
+              <summary>All attempts with parameters</summary>
+              <AttemptsTable runs={runs} best={best?.attempt} />
+            </details>
           </section>
 
           {c.report && (
@@ -187,6 +215,16 @@ export default function CasePage() {
                 )}
               </div>
               {c.report.recommendation && <p className="small muted">Recommendation: {c.report.recommendation}</p>}
+              <div className="row">
+                <a className="btn" href={reportUrl(c._id)}>
+                  ⬇ Evidence report (Markdown)
+                </a>
+                {best?.mask_url && (
+                  <a className="btn" href={fileUrl(best.mask_url)}>
+                    ⬇ Repaired label mask (TIFF)
+                  </a>
+                )}
+              </div>
             </section>
           )}
         </div>

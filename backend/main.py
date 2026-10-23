@@ -64,7 +64,7 @@ def health():
     return {"ok": True, "storage": repo.backend,
             "planner": "gemini" if settings.gemini_api_key else "heuristic (offline)",
             "model": settings.gemini_model if settings.gemini_api_key else None,
-            "max_attempts": settings.max_attempts}
+            "max_rounds": settings.max_rounds, "candidates_per_round": settings.candidates_per_round}
 
 
 @app.get("/api/samples")
@@ -191,3 +191,72 @@ def review(case_id: str, body: ReviewIn):
 def search(q: str, limit: int = 20):
     results, mode = repo.search_cases(q, limit)
     return {"mode": mode, "results": results}
+
+
+@app.get("/api/cases/{case_id}/report.md")
+def report_markdown(case_id: str):
+    """Reproducible evidence report: diagnosis, tournament, verification, suspects, files and checksums."""
+    from fastapi.responses import PlainTextResponse
+
+    case = repo.get("cases", case_id)
+    if not case:
+        raise HTTPException(404)
+    q = {"case_id": case_id}
+    runs = [r for r in repo.find("analysis_runs", q, sort="attempt") if r["attempt"] > 0]
+    reviews = repo.find("reviews", q)
+    assets = repo.find("assets", q)
+    best, bm = case.get("best_attempt") or {}, case.get("baseline_metrics")
+    rep = case.get("report") or {}
+    lines = [f"# Investigation report: {case['title']}", "",
+             f"- Case ID: `{case_id}`", f"- Status: **{case['status']}**",
+             f"- Lead investigator: {case.get('planner', 'n/a')}",
+             f"- Started: {case.get('started_at', '')}  Finished: {case.get('finished_at', '')}",
+             f"- Reference mask: {'yes (verified results)' if case.get('has_reference') else 'no (proxy checks only)'}",
+             "", "Research image-analysis quality control. Not a diagnostic or clinical result.", "",
+             "## Summary", "", rep.get("summary", ""), ""]
+    if case.get("root_causes"):
+        lines += ["## Root-cause diagnosis", ""]
+        lines += [f"- **{c['cause']}** ({c['likelihood']}): {c['evidence']}" for c in case["root_causes"]]
+        lines.append("")
+    if case.get("rounds"):
+        lines += ["## Hypothesis tournament", ""]
+        for r in case["rounds"]:
+            lines += [f"### Round {r['round']}", "", "| Rank | Candidate | Hypothesis | Tool | F1 | Result |",
+                      "|---|---|---|---|---|---|"]
+            for i, e in enumerate(r["entries"], 1):
+                f1 = f"{e['f1']:.3f}" if e.get("f1") is not None else "n/a"
+                res = "passed" if e["passed"] else "unverified" if e["unverified_improvement"] else \
+                    "failed: " + ", ".join(e["failed_checks"])
+                lines.append(f"| {i} | {e['candidate']} | {e['hypothesis']} | {e['tool']} | {f1} | {res} |")
+            lines.append("")
+    if bm and best.get("metrics"):
+        am = best["metrics"]
+        lines += ["## Verification against reference", "", "| Metric | Baseline | Repaired |", "|---|---|---|",
+                  f"| Instance F1 | {bm['f1']:.3f} | {am['f1']:.3f} |",
+                  f"| Cell count (reference {am['ref_count']}) | {bm['pred_count']} | {am['pred_count']} |",
+                  f"| Merged objects | {bm['merged_objects']} | {am['merged_objects']} |",
+                  f"| Foreground IoU | {bm['foreground_iou']:.3f} | {am['foreground_iou']:.3f} |", ""]
+    if case.get("suspects"):
+        lines += ["## Suspect lineup", "", "| # | Area (px) | Solidity | Reference nuclei | Pieces after | Verdict |",
+                  "|---|---|---|---|---|---|"]
+        lines += [f"| {s['rank']} | {s['area']} | {s['solidity']} | {s['ref_nuclei'] if s['ref_nuclei'] is not None else 'n/a'}"
+                  f" | {s['pieces_after']} | {s['verdict']} |" for s in case["suspects"]]
+        lines.append("")
+    for title, key in (("What changed", "what_changed"), ("Measured improvements", "improvements"),
+                       ("Remaining uncertainty", "uncertainties")):
+        if rep.get(key):
+            lines += [f"## {title}", ""] + [f"- {x}" for x in rep[key]] + [""]
+    if reviews:
+        lines += ["## Human review", ""]
+        lines += [f"- {r['reviewer']}: **{r['decision']}** {('- ' + r['comment']) if r.get('comment') else ''}"
+                  for r in reviews]
+        lines.append("")
+    lines += ["## Reproducibility", "", f"{len(runs)} attempts; each can be re-run with the parameters below.", "",
+              "| Attempt | Round | Tool | Base | Parameters |", "|---|---|---|---|---|"]
+    lines += [f"| {r['attempt']} | {r.get('round', '')} | {r['tool']} | {r.get('base', '')} | "
+              f"{', '.join(f'{k}={v}' for k, v in r['params'].items())} |" for r in runs]
+    lines += ["", "| File | Role | SHA-256 |", "|---|---|---|"]
+    lines += [f"| {a['path']} | {a['role']} | `{a['sha256'][:16]}…` |" for a in assets if a["source"] == "upload"
+              or a["role"] == "repaired_mask" and a["url"] == best.get("mask_url")]
+    return PlainTextResponse("\n".join(lines) + "\n", media_type="text/markdown",
+                             headers={"Content-Disposition": f'attachment; filename="cell-crime-scene-{case_id}.md"'})

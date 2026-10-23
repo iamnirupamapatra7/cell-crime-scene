@@ -67,3 +67,20 @@ def test_second_rerun_while_running_is_refused(client, monkeypatch):
     monkeypatch.setattr(main.BackgroundTasks, "add_task", lambda *a, **k: None)  # keep the run "in flight"
     assert client.post(f"/api/cases/{case['_id']}/investigate").status_code == 200
     assert client.post(f"/api/cases/{case['_id']}/investigate").status_code == 409
+
+
+def test_tournament_diagnosis_suspects_and_report(client):
+    case = client.post("/api/cases/sample/merged_nuclei_demo").json()
+    detail = client.get(f"/api/cases/{case['_id']}").json()
+    c = detail["case"]
+    assert c["root_causes"] and c["root_causes"][0]["evidence"]
+    first = c["rounds"][0]
+    assert len(first["entries"]) >= 2  # competing candidates, ranked
+    assert first["winner"] == first["entries"][0]["attempt"]
+    assert {r["round"] for r in detail["runs"] if r["attempt"] > 0} == {r["round"] for r in c["rounds"]}
+    assert c["suspects"] and all(s["verdict"] for s in c["suspects"])
+    assert any(s["outcome"] == "good" for s in c["suspects"])
+    assert client.get(c["assets"]["diff_overlay"]).status_code == 200
+    md = client.get(f"/api/cases/{c['_id']}/report.md")
+    assert md.status_code == 200
+    assert "## Hypothesis tournament" in md.text and "## Suspect lineup" in md.text

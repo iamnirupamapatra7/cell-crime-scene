@@ -16,22 +16,28 @@ the researcher spots it by eye, tweaks parameters, reruns and compares, one imag
 ## What the agent does
 
 ```
-inspect → hypothesise → repair → verify → retry / accept / abstain → report → human review
+inspect → recall → diagnose → hypothesis tournament (verify every candidate) → refine winner → accept / abstain
+        → suspect lineup → report → human review
 ```
 
 1. **Inspect** (Python): counts objects and measures area and solidity; flags oversized or concave objects.
 2. **Recall** (MongoDB Atlas hybrid search): retrieves past verified repairs with matching failure tags and a
    similar image fingerprint, and the tool that fixed each one.
-3. **Decide** (Gemini 4 Argon): reads the measurements, the microscopy image, an overlay of the current
-   segmentation and the verification feedback from earlier attempts. Picks one allowlisted tool with
-   parameters, or accepts, or abstains.
-4. **Repair** (Python): runs the tool on a copy. The original image and mask are checksummed and never modified.
-5. **Verify** (Python, independent of the model): compares the candidate with the reference mask using
-   instance F1, count error and foreground IoU, plus integrity checks. Pass/fail comes from a fixed
-   acceptance policy, never from the model's explanation.
-6. **Retry or stop**: at most 4 attempts. "Accept" is refused unless an attempt passed verification.
-7. **Report and review**: before/after overlays, metrics, the agent's reasoning and its stated uncertainties.
-   A human approves or rejects the result.
+3. **Diagnose** (Gemini 4 Argon): explains *why* the segmentation failed, with each root cause tied to
+   evidence (region areas, solidity, SNR, noise, crowding) and a likelihood.
+4. **Hypothesis tournament** (Gemini 4 Argon designs it, Python runs it): each round, the agent proposes
+   2–3 *competing* hypotheses, for example "touching round nuclei, so split on shape", "a dim seam between
+   nuclei, so split on intensity", "thin bridges, so erode". Each one is tested with an allowlisted tool on a
+   copy. The original image and mask are checksummed and never modified.
+5. **Verify every candidate** (Python, independent of the model): instance F1, count error, foreground IoU
+   and integrity checks against a fixed acceptance policy. Candidates are ranked on a leaderboard. Gemini
+   reads the leaderboard, refines the winner or tests new hypotheses, and accepts or abstains. At most 3
+   rounds. "Accept" is refused unless a candidate passed verification.
+6. **Suspect lineup**: every flagged region gets its own verdict against the reference annotation (solved,
+   partly split, still merged, over-split, or correctly left whole), with before/after/truth crops.
+7. **Report and review**: a before/after slider, a change map (red = merged outlines, green = new cuts),
+   metrics, the agent's reasoning and its stated uncertainties, and a downloadable evidence report. A human
+   approves or rejects the result.
 
 ## Agent tools (allowlist)
 
@@ -44,9 +50,9 @@ bounds below before execution (`backend/tools/registry.py`).
 | `erosion_split` | Erode to break thin bridges, regrow cores within the original outline | `radius` 1–8, `target` |
 | `remove_small_objects` | Drop debris fragments | `min_size` 5–500 |
 | `resegment_threshold` | Re-segment from scratch (Otsu, Li or local threshold) | `method`, `sigma` 0–4, `min_size` |
-| `accept` / `abstain` | Finalise the best verified attempt for review, or flag the case as unresolved | — |
-
-Each tool can work on the original baseline or refine the best attempt so far (`base`).
+Each tool can work on the original baseline or refine the current winner (`base`). The planner's actions
+are `experiment` (a list of competing candidates), `accept` (send the best verified attempt for review) and
+`abstain` (flag the case as unresolved).
 
 ## Verification signal
 
@@ -68,9 +74,9 @@ used during development (`python backend/scripts/evaluate.py --dir datasets/held
 
 | | Before | After |
 |---|---|---|
-| Verified repairs | – | 11 / 12 (1 correctly abstained) |
-| Mean instance F1 | 0.785 | 0.882 |
-| Mean \|count error\| | 8.0 | 4.5 |
+| Verified repairs | – | 12 / 12 |
+| Mean instance F1 | 0.785 | 0.887 |
+| Mean \|count error\| | 8.0 | 4.1 |
 | Mean foreground IoU | 0.828 | 0.828 |
 
 These figures come from the offline heuristic planner, which is the baseline the Gemini agent has to beat.
@@ -80,7 +86,7 @@ _[Add the same table for gemini-4-argon once it has run.]_
 
 | Model | Role |
 |---|---|
-| `gemini-4-argon` | Lead investigator. One call per decision: multimodal input (measurements as JSON, the microscopy image and the segmentation overlay), structured JSON output validated against a schema. Also writes the final report from the recorded metrics. |
+| `gemini-4-argon` | Lead investigator. One call per tournament round: multimodal input (measurements as JSON, the microscopy image, the current segmentation overlay, every earlier leaderboard), structured JSON output validated against a schema (root causes, competing candidates, or accept/abstain). Also writes the final report from the recorded metrics. |
 
 - **Interactions API** (`client.interactions.create`), with `previous_interaction_id` chaining, so the
   investigation keeps server-side state across turns.

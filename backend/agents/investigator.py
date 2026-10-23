@@ -1,4 +1,4 @@
-"""The investigation loop: inspect -> hypothesise -> repair -> verify -> decide -> report.
+"""The investigation loop: inspect -> diagnose -> tournament of competing repairs -> verify -> decide -> report.
 
 The planner (Gemini, or the heuristic fallback) only chooses among allowlisted tools; Python executes
 them with clamped parameters and verifies every result independently. Every step is persisted.
@@ -14,7 +14,8 @@ from services.atlas import fingerprint, now, similar_cases
 from tools import registry
 from tools.inspect_image import analyze_mask, find_suspicious_regions, inspect_image
 from tools.io import load_image, load_labels, save_labels, save_png, sha256
-from tools.render import grayscale, overlay
+from tools.suspects import suspect_verdicts
+from tools.render import diff_overlay, grayscale, overlay
 from tools.verify_result import (ACCEPTANCE_POLICY, evaluate_candidate, instance_metrics, integrity_checks,
                                  mask_summary)
 
@@ -166,23 +167,28 @@ class Investigation:
                       "Ranked by matching failure tags and a similar image/mask fingerprint; "
                       "the tools that fixed them are passed to the planner.", data={"cases": prior})
 
-        # 2. Agent loop ------------------------------------------------------------------------------
-        attempts, best, best_labels, hypothesis = [], None, None, None
+        # 2. Agent loop: tournament rounds of competing hypotheses -----------------------------------
+        attempts, rounds, best, best_labels, hypothesis, root_causes = [], [], None, None, None, []
         image_checksum = assets["image"]["sha256"]
         original_png = _png(grayscale(img, 1))
         current_overlay = _png(overlay(img, baseline, [r["bbox"] for r in suspicious], scale=1))
         accepted = False
+        max_rounds, per_round = self.settings.max_rounds, self.settings.candidates_per_round
+        n = 0
 
-        for n in range(1, self.settings.max_attempts + 1):
+        for rnd in range(1, max_rounds + 1):
             state = {
                 "case": {"title": case.get("title"), "notes": case.get("notes"), "has_reference": ref is not None},
                 "image_stats": stats,
                 "baseline": {"mask": base_summary, "metrics": base_metrics, "suspicious_regions": suspicious[:8]},
-                "attempts": [{k: a[k] for k in ("attempt", "tool", "params", "base", "mask_summary", "metrics",
-                                                 "verdict")} for a in attempts],
+                "attempts": [{k: a.get(k) for k in ("attempt", "round", "candidate", "tool", "params", "base",
+                                                     "mask_summary", "metrics", "verdict")} for a in attempts],
+                "rounds": rounds,
                 "best_attempt": best and best["attempt"],
                 "hypothesis": hypothesis,
-                "remaining_attempts": self.settings.max_attempts - n + 1,
+                "round": rnd,
+                "remaining_rounds": max_rounds - rnd + 1,
+                "candidates_per_round": per_round,
                 "tools": registry.catalog(),
                 "acceptance_policy": ACCEPTANCE_POLICY,
                 "similar_past_cases": prior,
@@ -191,10 +197,18 @@ class Investigation:
                       ("Current best segmentation overlay (red boxes = suspicious):", current_overlay)]
             decision, actor = self.decide(state, images)
             hypothesis = decision.hypothesis
-            self.step("decision", actor, f"{decision.action}: {decision.hypothesis}", decision.rationale,
-                      decision.model_dump())
-            repo.insert("evidence", {"case_id": case_id, "kind": "hypothesis", "attempt": n, "actor": actor,
+            if decision.root_causes and not root_causes:
+                root_causes = [c.model_dump() for c in decision.root_causes]
+                self.step("diagnosis", actor, f"Root-cause diagnosis: {root_causes[0]['cause']}",
+                          "; ".join(f"{c['cause']} ({c['likelihood']})" for c in root_causes),
+                          {"root_causes": root_causes})
+            cands = decision.candidates[:per_round] if decision.action == "experiment" else []
+            title = (f"Round {rnd}: {len(cands)} competing hypotheses" if cands
+                     else f"{decision.action}: {decision.hypothesis}")
+            self.step("decision", actor, title, decision.rationale, decision.model_dump())
+            repo.insert("evidence", {"case_id": case_id, "kind": "hypothesis", "round": rnd, "actor": actor,
                                      "text": decision.hypothesis, "observations": decision.observations,
+                                     "candidates": [c.model_dump() for c in cands],
                                      "confidence": decision.confidence})
 
             if decision.action == "accept":
@@ -205,61 +219,89 @@ class Investigation:
                     break
                 self.step("guardrail", "python", "Accept refused: no attempt has passed independent verification")
                 continue
-            if decision.action == "abstain":
+            if decision.action == "abstain" or not cands:
                 self.step("decision", "python", "Agent abstained", decision.rationale)
                 break
 
-            raw = decision.params.model_dump(exclude_none=True)
-            params, notes = registry.validate_params(decision.action, raw)
-            base_name = "best" if raw.get("base") == "best" and best_labels is not None else "baseline"
-            base_labels = best_labels if base_name == "best" else baseline
-            base_susp = find_suspicious_regions(base_labels, typical_area)
-            if notes:
-                self.step("guardrail", "python", "Parameters adjusted to allowed bounds", "; ".join(notes))
+            entries = []
+            for cand in cands:
+                n += 1
+                raw = cand.params.model_dump(exclude_none=True)
+                params, notes = registry.validate_params(cand.tool, raw)
+                base_name = "best" if raw.get("base") == "best" and best_labels is not None else "baseline"
+                base_labels = best_labels if base_name == "best" else baseline
+                base_susp = find_suspicious_regions(base_labels, typical_area)
+                if notes:
+                    self.step("guardrail", "python", f"{cand.name}: parameters adjusted to allowed bounds",
+                              "; ".join(notes))
 
-            new_labels, tool_summary = registry.TOOLS[decision.action]["fn"](
-                img, base_labels, **params, suspicious_labels=[r["label"] for r in base_susp])
-            self.step("tool", "python", f"Ran {decision.action} on {base_name} mask",
-                      ", ".join(f"{k}={v}" for k, v in params.items()), {"params": params, **tool_summary})
+                new_labels, tool_summary = registry.TOOLS[cand.tool]["fn"](
+                    img, base_labels, **params, suspicious_labels=[r["label"] for r in base_susp])
+                self.step("tool", "python", f"{cand.name}: ran {cand.tool} on {base_name} mask",
+                          ", ".join(f"{k}={v}" for k, v in params.items()), {"params": params, **tool_summary})
 
-            # 3. Independent verification -----------------------------------------------------------
-            new_susp = find_suspicious_regions(new_labels, typical_area)
-            summary = mask_summary(new_labels, typical_area, new_susp)
-            metrics = instance_metrics(new_labels, ref) if ref is not None else None
-            integrity = integrity_checks(baseline, new_labels, sha256(image_path) == image_checksum, decision.action)
-            verdict = evaluate_candidate(base_metrics, metrics, integrity, len(suspicious), len(new_susp))
-            mask_asset = self.save_asset("repaired_mask", f"derived/attempt_{n}_mask.tif", labels=new_labels,
-                                         version=n + 1)
-            ov = overlay(img, new_labels, [r["bbox"] for r in new_susp])
-            ov_asset = self.save_asset("attempt_overlay", f"derived/attempt_{n}_overlay.png", ov, version=n + 1)
-            run = repo.insert("analysis_runs", {
-                "case_id": case_id, "attempt": n, "tool": decision.action, "params": params, "base": base_name,
-                "actor": actor, "tool_summary": tool_summary, "mask_summary": summary, "metrics": metrics,
-                "verdict": verdict, "overlay_url": ov_asset["url"], "mask_url": mask_asset["url"]})
-            attempts.append(run)
-            failed = [c["name"] for c in verdict["checks"] if not c["passed"]]
-            if verdict["passed"]:
-                title = f"Attempt {n} PASSED verification"
-            elif verdict.get("unverified_improvement"):
-                title = f"Attempt {n} improved proxy metrics (unverified: no reference)"
+                # 3. Independent verification -------------------------------------------------------
+                new_susp = find_suspicious_regions(new_labels, typical_area)
+                summary = mask_summary(new_labels, typical_area, new_susp)
+                metrics = instance_metrics(new_labels, ref) if ref is not None else None
+                integrity = integrity_checks(baseline, new_labels, sha256(image_path) == image_checksum, cand.tool)
+                verdict = evaluate_candidate(base_metrics, metrics, integrity, len(suspicious), len(new_susp))
+                mask_asset = self.save_asset("repaired_mask", f"derived/attempt_{n}_mask.tif", labels=new_labels,
+                                             version=n + 1)
+                ov = overlay(img, new_labels, [r["bbox"] for r in new_susp])
+                ov_asset = self.save_asset("attempt_overlay", f"derived/attempt_{n}_overlay.png", ov, version=n + 1)
+                run = repo.insert("analysis_runs", {
+                    "case_id": case_id, "attempt": n, "round": rnd, "candidate": cand.name,
+                    "hypothesis": cand.hypothesis, "tool": cand.tool, "params": params, "base": base_name,
+                    "actor": actor, "tool_summary": tool_summary, "mask_summary": summary, "metrics": metrics,
+                    "verdict": verdict, "overlay_url": ov_asset["url"], "mask_url": mask_asset["url"]})
+                attempts.append(run)
+                failed = [c["name"] for c in verdict["checks"] if not c["passed"]]
+                if verdict["passed"]:
+                    title = f"{cand.name} (attempt {n}) PASSED verification"
+                elif verdict.get("unverified_improvement"):
+                    title = f"{cand.name} (attempt {n}) improved proxy metrics (unverified: no reference)"
+                else:
+                    title = f"{cand.name} (attempt {n}) FAILED: {', '.join(failed)}"
+                self.step("verify", "python", title, data=verdict | {"metrics": metrics})
+                repo.insert("evidence", {"case_id": case_id, "kind": "verification", "attempt": n, "round": rnd,
+                                         **verdict})
+
+                candidate_ok = verdict["passed"] or verdict.get("unverified_improvement")
+                better = best is None or (
+                    metrics["f1"] > best["metrics"]["f1"] if metrics else
+                    summary["suspicious_regions"] < best["mask_summary"]["suspicious_regions"])
+                if candidate_ok and better:
+                    best = {"attempt": n, "tool": cand.tool, "candidate": cand.name, "params": params,
+                            "metrics": metrics, "mask_summary": summary, "overlay_url": ov_asset["url"],
+                            "mask_url": mask_asset["url"], "verified": bool(verdict["passed"])}
+                    best_labels = new_labels
+                    current_overlay = _png(overlay(img, new_labels, [r["bbox"] for r in new_susp], scale=1))
+                entries.append({"attempt": n, "candidate": cand.name, "hypothesis": cand.hypothesis,
+                                "tool": cand.tool, "params": params, "base": base_name,
+                                "passed": bool(verdict["passed"]),
+                                "unverified_improvement": bool(verdict.get("unverified_improvement")),
+                                "f1": metrics["f1"] if metrics else None,
+                                "count_error": metrics["count_error"] if metrics else None,
+                                "merged_objects": metrics["merged_objects"] if metrics else None,
+                                "suspicious_after": summary["suspicious_regions"], "failed_checks": failed})
+
+            # Leaderboard: passing candidates first, then by F1 (or fewest suspicious regions without a reference).
+            entries.sort(key=lambda e: (not (e["passed"] or e["unverified_improvement"]),
+                                        -(e["f1"] if e["f1"] is not None else -e["suspicious_after"])))
+            winner = entries[0] if entries and (entries[0]["passed"] or entries[0]["unverified_improvement"]) else None
+            rounds.append({"round": rnd, "entries": entries, "winner": winner and winner["attempt"]})
+            if winner:
+                score = f"F1 {winner['f1']:.3f}" if winner["f1"] is not None else \
+                    f"{winner['suspicious_after']} suspicious regions left"
+                self.step("tournament", "python", f"Round {rnd} leaderboard: {winner['candidate']} wins ({score})",
+                          " > ".join(e["candidate"] for e in entries), {"round": rounds[-1]})
             else:
-                title = f"Attempt {n} FAILED: {', '.join(failed)}"
-            self.step("verify", "python", title, data=verdict | {"metrics": metrics})
-            repo.insert("evidence", {"case_id": case_id, "kind": "verification", "attempt": n, **verdict})
-
-            candidate = verdict["passed"] or verdict.get("unverified_improvement")
-            better = best is None or (
-                metrics["f1"] > best["metrics"]["f1"] if metrics else
-                summary["suspicious_regions"] < best["mask_summary"]["suspicious_regions"])
-            if candidate and better:
-                best = {"attempt": n, "tool": decision.action, "params": params, "metrics": metrics,
-                        "mask_summary": summary, "overlay_url": ov_asset["url"], "mask_url": mask_asset["url"],
-                        "verified": bool(verdict["passed"])}
-                best_labels = new_labels
-                current_overlay = _png(overlay(img, new_labels, [r["bbox"] for r in new_susp], scale=1))
+                self.step("tournament", "python", f"Round {rnd} leaderboard: no candidate passed",
+                          " > ".join(e["candidate"] for e in entries), {"round": rounds[-1]})
 
         if best and not accepted:
-            self.step("guardrail", "python", f"Attempt budget exhausted; best verified attempt {best['attempt']} "
+            self.step("guardrail", "python", f"Round budget exhausted; best verified attempt {best['attempt']} "
                                              "selected for review")
         if best:
             status = "awaiting_review"
@@ -271,22 +313,38 @@ class Investigation:
             self.step("decision", "python", "Unresolved: flagged for human investigation",
                       "No attempt passed independent verification.")
 
-        # 4. Report -----------------------------------------------------------------------------------
+        # 4. Suspect lineup and change map ------------------------------------------------------------
+        suspects = suspect_verdicts(baseline, best_labels, ref, suspicious)
+        for s in suspects:
+            repo.insert("evidence", {"case_id": case_id, "kind": "suspect", **s})
+        diff_url = None
+        if best_labels is not None:
+            diff_url = self.save_asset("diff_overlay", "derived/diff.png", diff_overlay(img, baseline, best_labels))["url"]
+        if suspects and ref is not None:
+            solved = sum(s["outcome"] == "good" for s in suspects)
+            self.step("verify", "python", f"Suspect lineup: {solved} of {len(suspects)} flagged regions resolved "
+                                          "correctly", ", ".join(f"#{s['rank']} {s['verdict']}" for s in suspects),
+                      {"suspects": suspects})
+
+        # 5. Report -----------------------------------------------------------------------------------
         final_state = {"baseline": {"metrics": base_metrics, "mask": base_summary},
-                       "attempts": [{k: a.get(k) for k in ("attempt", "tool", "params", "metrics", "verdict")}
-                                    for a in attempts],
+                       "root_causes": root_causes,
+                       "attempts": [{k: a.get(k) for k in ("attempt", "round", "candidate", "tool", "params",
+                                                            "metrics", "verdict")} for a in attempts],
+                       "rounds": rounds, "suspects": suspects,
                        "best_attempt": best, "hypothesis": hypothesis, "status": status}
         report, actor = self.report(final_state)
         self.step("report", actor, "Investigation report written", report.summary)
         repo.update("cases", case_id, {
             "status": status, "finished_at": now(), "hypothesis": hypothesis, "best_attempt": best,
             "baseline_metrics": base_metrics, "baseline_summary": base_summary, "image_stats": stats,
-            "attempt_count": len(attempts), "report": report.model_dump(),
+            "attempt_count": len(attempts), "round_count": len(rounds), "rounds": rounds,
+            "root_causes": root_causes, "suspects": suspects, "report": report.model_dump(),
             "tags": _tags(stats, suspicious, attempts, status),
             "assets": {"original": self.url("derived/original.png"), "baseline_overlay": base_ov_asset["url"],
-                       "reference_overlay": self.url("derived/reference_overlay.png") if ref is not None else None},
+                       "reference_overlay": self.url("derived/reference_overlay.png") if ref is not None else None,
+                       "diff_overlay": diff_url},
         })
-
 
 def run_investigation(case_id, repo, settings, planner=None):
     Investigation(case_id, repo, settings, planner).run()

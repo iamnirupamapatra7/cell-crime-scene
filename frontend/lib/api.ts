@@ -32,6 +32,7 @@ export type Verdict = { mode: "reference" | "reference_free"; passed: boolean; u
 
 export type BestAttempt = {
   attempt: number;
+  candidate?: string;
   tool: string;
   params: Record<string, unknown>;
   metrics: Metrics | null;
@@ -47,6 +48,40 @@ export type Report = {
   improvements: string[];
   uncertainties: string[];
   recommendation: string;
+};
+
+export type RootCause = { cause: string; evidence: string; likelihood: "high" | "medium" | "low" };
+
+export type RoundEntry = {
+  attempt: number;
+  candidate: string;
+  hypothesis: string;
+  tool: string;
+  params: Record<string, unknown>;
+  base: string;
+  passed: boolean;
+  unverified_improvement: boolean;
+  f1: number | null;
+  count_error: number | null;
+  merged_objects: number | null;
+  suspicious_after: number;
+  failed_checks: string[];
+};
+
+export type Round = { round: number; entries: RoundEntry[]; winner: number | null };
+
+export type Suspect = {
+  rank: number;
+  label: number;
+  bbox: [number, number, number, number];
+  area: number;
+  solidity: number;
+  estimated_nuclei: number;
+  reasons: string[];
+  pieces_after: number;
+  ref_nuclei: number | null;
+  verdict: string;
+  outcome: "good" | "partial" | "bad" | "unverified";
 };
 
 export type CaseStatus =
@@ -74,10 +109,15 @@ export type Case = {
   baseline_metrics?: Metrics | null;
   baseline_summary?: MaskSummary;
   attempt_count?: number;
+  round_count?: number;
+  rounds?: Round[];
+  root_causes?: RootCause[];
+  suspects?: Suspect[];
+  image_stats?: { shape: [number, number]; snr: number; noise_sigma: number; foreground_fraction: number };
   report?: Report;
   error?: string;
   score?: number;
-  assets?: { original: string; baseline_overlay: string; reference_overlay: string | null };
+  assets?: { original: string; baseline_overlay: string; reference_overlay: string | null; diff_overlay?: string | null };
 };
 
 export type Step = {
@@ -94,6 +134,9 @@ export type Step = {
 export type Run = {
   _id: string;
   attempt: number;
+  round?: number;
+  candidate?: string;
+  hypothesis?: string;
   tool: string;
   params: Record<string, unknown>;
   base?: string;
@@ -121,7 +164,16 @@ export type CaseDetail = { case: Case; steps: Step[]; runs: Run[]; reviews: Revi
 
 export type Sample = { id: string; title: string; notes: string; reference_count: number; baseline_count: number; preview: string };
 
-export type Health = { ok: boolean; storage: string; planner: string; model: string | null; max_attempts: number };
+export type Health = {
+  ok: boolean;
+  storage: string;
+  planner: string;
+  model: string | null;
+  max_rounds: number;
+  candidates_per_round: number;
+};
+
+export const reportUrl = (caseId: string) => `${API}/api/cases/${caseId}/report.md`;
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${API}${path}`, { cache: "no-store", ...init });

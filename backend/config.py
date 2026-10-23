@@ -23,7 +23,8 @@ class Settings(BaseSettings):
 
     storage_dir: Path = ROOT / "storage"
     sample_dir: Path = ROOT / "sample_cases"
-    max_attempts: int = 4
+    max_rounds: int = 3
+    candidates_per_round: int = 3
     cors_origins: str = "http://localhost:3000"
 
 

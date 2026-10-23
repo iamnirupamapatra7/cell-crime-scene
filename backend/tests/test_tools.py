@@ -83,3 +83,23 @@ def test_hybrid_search_ranks_similar_fingerprint_first(tmp_path):
     assert vec[-1]["_id"] == "far"
     hybrid, mode = repo.hybrid_search("merged nuclei", [0.4, -0.2, 0.1], 3)
     assert hybrid[0]["_id"] == "near" and mode.startswith("local-hybrid")
+
+
+def test_suspect_verdicts_against_reference():
+    import numpy as np
+    from tools.suspects import suspect_verdicts
+
+    ref = np.zeros((20, 40), np.int32)
+    ref[5:15, 2:12], ref[5:15, 12:22] = 1, 2          # two touching nuclei
+    ref[5:15, 28:36] = 3                               # one genuinely single nucleus
+    baseline = np.zeros_like(ref)
+    baseline[5:15, 2:22], baseline[5:15, 28:36] = 1, 2  # merged pair + single
+    repaired = baseline.copy()
+    repaired[5:15, 12:22] = 3                          # pair split correctly
+    regions = [{"label": 1, "bbox": [5, 2, 15, 22], "area": 200, "solidity": 1.0, "estimated_nuclei": 2,
+                "reasons": []},
+               {"label": 2, "bbox": [5, 28, 15, 36], "area": 80, "solidity": 1.0, "estimated_nuclei": 1,
+                "reasons": []}]
+    v = suspect_verdicts(baseline, repaired, ref, regions)
+    assert [s["verdict"] for s in v] == ["solved", "correctly left whole"]
+    assert suspect_verdicts(baseline, baseline, ref, regions)[0]["verdict"] == "still merged"
