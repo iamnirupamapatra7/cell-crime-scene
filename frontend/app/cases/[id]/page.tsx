@@ -29,7 +29,17 @@ export default function CasePage() {
     return () => clearInterval(t);
   }, [running, load]);
 
-  if (error) return <p className="error-box">{error}</p>;
+  if (error)
+    return (
+      <div className="stack">
+        <p className="error-box">
+          {error === "Not Found" ? "This case doesn't exist in the current database." : error}
+        </p>
+        <Link href="/" className="small">
+          ← All investigations
+        </Link>
+      </div>
+    );
   if (!detail) return <p className="muted">Loading…</p>;
 
   const { case: c, steps, runs, reviews, similar } = detail;
