@@ -153,13 +153,18 @@ pre { background: var(--bg); border: 1px solid var(--border); border-radius: 6px
 
 /* segmented control */
 .segmented { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; align-self: flex-start; }
+.compare + .viewer { width: min(100%, 62vh, 560px); margin: 0 auto; }
 .segmented button {
   font: inherit; font-size: 12px; padding: 0.3rem 0.8rem; background: transparent; color: var(--muted); border: 0; cursor: pointer;
 }
 .segmented button[aria-selected="true"] { background: var(--panel-2); color: var(--text); }
 
 /* before/after slider */
-.compare { position: relative; border-radius: 6px; overflow: hidden; background: #000; user-select: none; }
+/* Square microscopy fields: keep the whole image on screen instead of filling the column width. */
+.compare {
+  position: relative; border-radius: 6px; overflow: hidden; background: #000; user-select: none;
+  width: min(100%, 62vh, 560px); margin: 0 auto;
+}
 .compare img { display: block; width: 100%; image-rendering: pixelated; }
 .compare .compare-top { position: absolute; inset: 0; height: 100%; }
 .compare-line {
