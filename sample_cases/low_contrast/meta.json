@@ -1,0 +1,15 @@
+{
+  "title": "Low-contrast noisy acquisition",
+  "notes": "Dim staining and higher camera noise; segmentation settings tuned on brighter images.",
+  "researcher": "Demo researcher",
+  "seed": 33,
+  "reference_count": 26,
+  "baseline_count": 18,
+  "source": "synthetic (generate_synthetic.py)",
+  "params": {
+    "n_single": 12,
+    "n_clusters": 6,
+    "contrast": 0.55,
+    "noise": 0.04
+  }
+}

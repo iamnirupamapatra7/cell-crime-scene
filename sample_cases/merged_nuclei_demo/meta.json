@@ -1,0 +1,13 @@
+{
+  "title": "Merged nuclei in a DAPI field",
+  "notes": "Global Otsu pipeline. Expected ~one label per nucleus; adjacent nuclei appear merged.",
+  "researcher": "Demo researcher",
+  "seed": 7,
+  "reference_count": 28,
+  "baseline_count": 19,
+  "source": "synthetic (generate_synthetic.py)",
+  "params": {
+    "n_single": 12,
+    "n_clusters": 7
+  }
+}

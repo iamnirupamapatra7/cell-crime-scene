@@ -1,0 +1,13 @@
+{
+  "title": "Control field without touching nuclei",
+  "notes": "Well-separated nuclei. Used to check the agent does not 'repair' a correct mask.",
+  "researcher": "Demo researcher",
+  "seed": 45,
+  "reference_count": 18,
+  "baseline_count": 18,
+  "source": "synthetic (generate_synthetic.py)",
+  "params": {
+    "n_single": 18,
+    "n_clusters": 0
+  }
+}

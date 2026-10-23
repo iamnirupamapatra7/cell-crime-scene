@@ -1,0 +1,15 @@
+google-genai>=2.3.0
+fastapi
+uvicorn[standard]
+python-multipart
+pydantic-settings
+pymongo>=4.7
+numpy
+scipy
+scikit-image
+PyWavelets
+opencv-python-headless
+pillow
+tifffile
+pytest
+httpx

@@ -1,0 +1,14 @@
+{
+  "title": "Dense nuclear clusters",
+  "notes": "High-density field with many 3-nucleus clusters; counts look low compared with manual counts.",
+  "researcher": "Demo researcher",
+  "seed": 21,
+  "reference_count": 34,
+  "baseline_count": 18,
+  "source": "synthetic (generate_synthetic.py)",
+  "params": {
+    "n_single": 8,
+    "n_clusters": 10,
+    "max_cluster": 3
+  }
+}

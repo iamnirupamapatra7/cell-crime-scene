@@ -1,0 +1,11 @@
+{
+  "title": "DSB2018 fluorescence field 8a26b1",
+  "notes": "Fluorescence nuclei, global Otsu pipeline. Adjacent nuclei appear merged in the baseline.",
+  "researcher": "",
+  "source": "DSB 2018 / BBBC038 stage1_train",
+  "image_id": "8a26b134fe9343c0c794513dae7787b7ac1debec3bb2a7096ab0b874a31d8175",
+  "reference_count": 29,
+  "baseline_count": 21,
+  "baseline_merged_objects": 4,
+  "baseline_f1": 0.72
+}

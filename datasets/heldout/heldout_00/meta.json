@@ -1,0 +1,14 @@
+{
+  "title": "Held-out field 00",
+  "notes": "held-out evaluation image",
+  "seed": 10000,
+  "reference_count": 25,
+  "baseline_count": 18,
+  "source": "synthetic (generate_synthetic.py)",
+  "params": {
+    "n_single": 14,
+    "n_clusters": 4,
+    "contrast": 0.8199565828575772,
+    "noise": 0.029018052034304555
+  }
+}
